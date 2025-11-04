@@ -1,0 +1,41 @@
+{
+  "name": "@screeny05/unstorage-driver-redis",
+  "version": "1.0.0",
+  "description": "Slightly modified Redis driver for unstorage",
+  "sideEffects": false,
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "unbuild --sourcemap",
+    "prepublishOnly": "tsc && npm run build",
+    "test": "vitest"
+  },
+  "author": "Sebastian Langer <sl@scn.cx>",
+  "homepage": "https://github.com/screeny05/unstorage-driver-redis",
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "unbuild": "^3.6.1",
+    "unstorage": "^1.10.2",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "unstorage": "1.x"
+  },
+  "keywords": [
+    "unstorage",
+    "redis"
+  ],
+  "dependencies": {
+    "ioredis": "^5.8.2"
+  }
+}
