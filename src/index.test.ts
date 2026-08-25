@@ -9,19 +9,19 @@ import createRedisDriver from './index';
 const h = vi.hoisted(() => {
   const commands: [string, ...unknown[]][] = [];
   const counters = { pipelines: 0, execs: 0 };
+  /** Set to make every pipelined command come back with this error, as ioredis does. */
+  let pipelineError: Error | null = null;
 
   const pipeline = {
     set(...args: unknown[]) {
       commands.push(['set', ...args]);
       return pipeline;
     },
-    expire(...args: unknown[]) {
-      commands.push(['expire', ...args]);
-      return pipeline;
-    },
     async exec() {
       counters.execs++;
-      return [];
+      return commands
+        .filter(([name]) => name === 'set')
+        .map(() => [pipelineError, 'OK'] as [Error | null, string]);
     },
   };
 
@@ -38,7 +38,14 @@ const h = vi.hoisted(() => {
     }
   }
 
-  return { commands, counters, FakeRedis };
+  return {
+    commands,
+    counters,
+    FakeRedis,
+    failPipelineWith: (error: Error | null) => {
+      pipelineError = error;
+    },
+  };
 });
 
 vi.mock('ioredis', () => {
@@ -65,9 +72,10 @@ beforeEach(() => {
   h.commands.length = 0;
   h.counters.pipelines = 0;
   h.counters.execs = 0;
+  h.failPipelineWith(null);
 });
 
-describe('setItems', () => {
+describe('setItems with an expiry', () => {
   it('carries the expiry on the write instead of applying it afterwards', async () => {
     await driver({ ttl: 60 }).setItems([item('a'), item('b')]);
 
@@ -75,10 +83,8 @@ describe('setItems', () => {
       ['set', 'a', 'value-of-a', 'EX', 60],
       ['set', 'b', 'value-of-b', 'EX', 60],
     ]);
-    // A key that exists untimed, even briefly, survives a process that dies before EXPIRE lands.
-    expect(
-      h.commands.some(([name]) => name === 'mset' || name === 'expire')
-    ).toBe(false);
+    // A key left untimed, even briefly, stays that way if the process dies before EXPIRE lands.
+    expect(h.commands.some(([name]) => name === 'mset')).toBe(false);
   });
 
   it('sends the whole batch as one pipeline', async () => {
@@ -97,13 +103,7 @@ describe('setItems', () => {
     ]);
   });
 
-  it('writes without an expiry when no ttl is configured anywhere', async () => {
-    await driver().setItems([item('a')]);
-
-    expect(h.commands).toEqual([['set', 'a', 'value-of-a']]);
-  });
-
-  it('mixes timed and untimed items in one pipeline', async () => {
+  it('keeps one untimed item out of the expiry, without leaving the pipeline', async () => {
     await driver().setItems([item('a', 30), item('b')]);
 
     expect(h.commands).toEqual([
@@ -113,16 +113,67 @@ describe('setItems', () => {
     expect(h.counters.pipelines).toBe(1);
   });
 
+  it('surfaces a failed write rather than resolving', async () => {
+    h.failPipelineWith(new Error('OOM command not allowed'));
+
+    // A pipeline resolves with per-command errors, so this rejects only because they are read.
+    await expect(driver({ ttl: 60 }).setItems([item('a')])).rejects.toThrow(
+      'OOM command not allowed'
+    );
+  });
+});
+
+describe('setItems without an expiry', () => {
+  it('writes the batch as a single MSET', async () => {
+    await driver().setItems([item('a'), item('b')]);
+
+    expect(h.commands).toEqual([
+      ['mset', 'a', 'value-of-a', 'b', 'value-of-b'],
+    ]);
+    expect(h.counters.pipelines).toBe(0);
+  });
+
   it('touches redis at all only when there is something to write', async () => {
     await driver({ ttl: 60 }).setItems([]);
 
+    expect(h.commands).toEqual([]);
     expect(h.counters.pipelines).toBe(0);
     expect(h.counters.execs).toBe(0);
   });
+});
 
-  it('prefixes keys with the configured base', async () => {
+describe('setItems in cluster mode', () => {
+  // Both MSET and pipelines require every key to hash to the same slot.
+  const cluster = { cluster: [{ host: '127.0.0.1', port: 6379 }] };
+
+  it('sends individual commands rather than a pipeline or an MSET', async () => {
+    await driver({ ...cluster, ttl: 60 }).setItems([item('a'), item('b')]);
+
+    expect(h.commands).toEqual([
+      ['set', 'a', 'value-of-a', 'EX', 60],
+      ['set', 'b', 'value-of-b', 'EX', 60],
+    ]);
+    expect(h.counters.pipelines).toBe(0);
+  });
+
+  it('still avoids MSET when no expiry applies', async () => {
+    await driver(cluster).setItems([item('a'), item('b')]);
+
+    expect(h.commands).toEqual([
+      ['set', 'a', 'value-of-a'],
+      ['set', 'b', 'value-of-b'],
+    ]);
+    expect(h.commands.some(([name]) => name === 'mset')).toBe(false);
+  });
+});
+
+describe('key prefixing', () => {
+  it('applies the configured base on both paths', async () => {
     await driver({ base: 'app', ttl: 60 }).setItems([item('a')]);
-
     expect(h.commands).toEqual([['set', 'app:a', 'value-of-a', 'EX', 60]]);
+
+    h.commands.length = 0;
+    await driver({ base: 'app' }).setItems([item('a')]);
+    expect(h.commands).toEqual([['mset', 'app:a', 'value-of-a']]);
   });
 });

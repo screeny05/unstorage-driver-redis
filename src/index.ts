@@ -128,23 +128,56 @@ export default defineDriver((opts: RedisOptions) => {
         return;
       }
 
-      // One pipelined `SET ... EX` per item rather than `MSET` followed by a pipeline of `EXPIRE`.
-      // `MSET` writes every key without a TTL, so until the `EXPIRE` round trip lands the keys are
-      // immortal — and a process that dies in that window, or a serverless isolate that freezes
-      // after responding, leaves them that way for good. `SET ... EX` carries the expiry with the
-      // write, so a key never exists untimed. It also costs one round trip instead of two, and one
-      // command per item instead of one per item plus the `MSET`, which providers that bill per
-      // command charge for.
-      const pipeline = getRedisClient().pipeline();
-      for (const item of items) {
-        const ttl = item.options?.ttl ?? commonOptions?.ttl ?? opts.ttl;
-        if (ttl) {
-          pipeline.set(p(item.key), item.value, 'EX', ttl);
-        } else {
-          pipeline.set(p(item.key), item.value);
-        }
+      const client = getRedisClient();
+      const defaultTtl = commonOptions?.ttl ?? opts.ttl;
+      const getTtl = (item: (typeof items)[number]) =>
+        item.options?.ttl ?? defaultTtl;
+
+      // In cluster mode both `MSET` and pipelines require every key to hash to the same slot, so
+      // send individual `SET` commands (mirroring `setItem`).
+      if (opts.cluster) {
+        await Promise.all(
+          items.map(item => {
+            const ttl = getTtl(item);
+            return ttl ?
+                client.set(p(item.key), item.value, 'EX', ttl)
+              : client.set(p(item.key), item.value);
+          })
+        );
+        return;
       }
-      await pipeline.exec();
+
+      // `MSET` cannot carry a per-key TTL. Where one applies, write each item as `SET ... EX` in a
+      // pipeline instead: `MSET` followed by `EXPIRE` would leave every key untimed until the
+      // second round trip lands, and a process that dies in that window — or a serverless isolate
+      // that freezes after responding — leaves them that way for good.
+      const hasTtl = defaultTtl || items.some(item => item.options?.ttl);
+      if (hasTtl) {
+        const pipeline = client.pipeline();
+        for (const item of items) {
+          const ttl = getTtl(item);
+          if (ttl) {
+            pipeline.set(p(item.key), item.value, 'EX', ttl);
+          } else {
+            pipeline.set(p(item.key), item.value);
+          }
+        }
+        // A pipeline resolves with per-command errors rather than rejecting, so a failed write is
+        // silent unless it is looked for.
+        const results = await pipeline.exec();
+        const error = results?.find(([error]) => error)?.[0];
+        if (error) {
+          throw error;
+        }
+        return;
+      }
+
+      // Nothing needs an expiry, so the whole batch is one command.
+      const args: string[] = [];
+      for (const item of items) {
+        args.push(p(item.key), item.value);
+      }
+      await client.mset(...args);
     },
     async removeItem(key) {
       await getRedisClient().unlink(p(key));
