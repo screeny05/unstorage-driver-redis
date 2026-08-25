@@ -2,21 +2,16 @@
 
 Provides an [unstorage](https://unstorage.unjs.io/) driver which uses [ioredis](https://github.com/redis/ioredis) to store data.
 
-This code is extracted from the [official unstorage driver](https://github.com/unjs/unstorage/blob/v1.17.2/src/drivers/redis.ts) for Redis with some slight modifications added:
+The [official driver](https://github.com/unjs/unstorage/blob/v1.17.2/src/drivers/redis.ts) gained
+`setItems` in [unstorage#782](https://github.com/unjs/unstorage/pull/782), which is on `2.0.0-alpha`
+and in no 1.x release. This package backports it: unstorage 1.17's driver plus that method. Without
+it unstorage falls back to one `setItem` call per item.
 
-- Support for `setItems` natively — a single `MSET` when no TTL applies, and a pipeline of
-  `SET ... EX` when one does
+`setItems` writes the batch as a single `MSET`, or as a pipeline of `SET ... EX` when a TTL applies
+— `MSET` cannot carry a per-key TTL, and applying `EXPIRE` afterwards would leave the keys untimed
+in between. Cluster mode sends individual commands, since `MSET` and pipelines both need one slot.
 
-  The official driver has no `setItems` in any 1.x release, so unstorage falls back to calling
-  `setItem` once per item.
-
-  `MSET` cannot carry a per-key TTL, which is why the expiry path writes each item individually.
-  Carrying the expiry on the write means a key never exists untimed — writing with `MSET` and
-  applying `EXPIRE` afterwards leaves a window in between, and a process that dies there, or a
-  serverless isolate that freezes after responding, leaves those keys immortal.
-
-  In cluster mode both `MSET` and pipelines require every key to hash to the same slot, so
-  individual `SET` commands are sent instead.
+**Once unstorage 2 is stable and your framework uses it, drop this package for `driver: 'redis'`.**
 
 ## Installation
 
