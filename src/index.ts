@@ -83,8 +83,9 @@ export default defineDriver((opts: RedisOptions) => {
     const keys: string[] = [];
     let cursor = '0';
     do {
-      const [nextCursor, scanKeys] = opts.scanCount
-        ? await client.scan(cursor, 'MATCH', pattern, 'COUNT', opts.scanCount)
+      const [nextCursor, scanKeys] =
+        opts.scanCount ?
+          await client.scan(cursor, 'MATCH', pattern, 'COUNT', opts.scanCount)
         : await client.scan(cursor, 'MATCH', pattern);
       cursor = nextCursor;
       keys.push(...scanKeys);
@@ -123,28 +124,60 @@ export default defineDriver((opts: RedisOptions) => {
       }
     },
     async setItems(items, commonOptions) {
-      const kv = Object.fromEntries(
-        items.map(item => [p(item.key), item.value])
-      );
-      await getRedisClient().mset(kv);
-
-      const ttls: [string, number][] = items
-        .map(item => {
-          const ttl = item.options?.ttl ?? commonOptions?.ttl ?? opts.ttl;
-          if (ttl) {
-            return [p(item.key), ttl];
-          }
-          return undefined;
-        })
-        .filter((item): item is [string, number] => item !== undefined);
-
-      if (ttls.length > 0) {
-        const pipeline = getRedisClient().pipeline();
-        ttls.forEach(ttl => {
-          pipeline.expire(ttl[0], ttl[1]);
-        });
-        await pipeline.exec();
+      if (items.length === 0) {
+        return;
       }
+
+      const client = getRedisClient();
+      const defaultTtl = commonOptions?.ttl ?? opts.ttl;
+      const getTtl = (item: (typeof items)[number]) =>
+        item.options?.ttl ?? defaultTtl;
+
+      // In cluster mode both `MSET` and pipelines require every key to hash to the same slot, so
+      // send individual `SET` commands (mirroring `setItem`).
+      if (opts.cluster) {
+        await Promise.all(
+          items.map(item => {
+            const ttl = getTtl(item);
+            return ttl ?
+                client.set(p(item.key), item.value, 'EX', ttl)
+              : client.set(p(item.key), item.value);
+          })
+        );
+        return;
+      }
+
+      // `MSET` cannot carry a per-key TTL. Where one applies, write each item as `SET ... EX` in a
+      // pipeline instead: `MSET` followed by `EXPIRE` would leave every key untimed until the
+      // second round trip lands, and a process that dies in that window — or a serverless isolate
+      // that freezes after responding — leaves them that way for good.
+      const hasTtl = defaultTtl || items.some(item => item.options?.ttl);
+      if (hasTtl) {
+        const pipeline = client.pipeline();
+        for (const item of items) {
+          const ttl = getTtl(item);
+          if (ttl) {
+            pipeline.set(p(item.key), item.value, 'EX', ttl);
+          } else {
+            pipeline.set(p(item.key), item.value);
+          }
+        }
+        // A pipeline resolves with per-command errors rather than rejecting, so a failed write is
+        // silent unless it is looked for.
+        const results = await pipeline.exec();
+        const error = results?.find(([error]) => error)?.[0];
+        if (error) {
+          throw error;
+        }
+        return;
+      }
+
+      // Nothing needs an expiry, so the whole batch is one command.
+      const args: string[] = [];
+      for (const item of items) {
+        args.push(p(item.key), item.value);
+      }
+      await client.mset(...args);
     },
     async removeItem(key) {
       await getRedisClient().unlink(p(key));
