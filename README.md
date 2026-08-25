@@ -4,7 +4,15 @@ Provides an [unstorage](https://unstorage.unjs.io/) driver which uses [ioredis](
 
 This code is extracted from the [official unstorage driver](https://github.com/unjs/unstorage/blob/v1.17.2/src/drivers/redis.ts) for Redis with some slight modifications added:
 
-- Support for setItems natively, running `mset` and a pipeline for `expire` for better performance
+- Support for `setItems` natively, as one pipelined `SET ... EX` per item
+
+  The official driver has no `setItems`, so unstorage falls back to calling `setItem` once per item
+  and relies on ioredis' `enableAutoPipelining` to coalesce them. This driver pipelines them
+  explicitly, so a batch write is one round trip whether or not that option is set.
+
+  Carrying the expiry on the write also means a key never exists without its TTL. Writing with
+  `MSET` and applying `EXPIRE` afterwards leaves a window in between, and a process that dies there
+  — or a serverless isolate that freezes after responding — leaves those keys immortal.
 
 ## Installation
 

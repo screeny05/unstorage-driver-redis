@@ -83,8 +83,9 @@ export default defineDriver((opts: RedisOptions) => {
     const keys: string[] = [];
     let cursor = '0';
     do {
-      const [nextCursor, scanKeys] = opts.scanCount
-        ? await client.scan(cursor, 'MATCH', pattern, 'COUNT', opts.scanCount)
+      const [nextCursor, scanKeys] =
+        opts.scanCount ?
+          await client.scan(cursor, 'MATCH', pattern, 'COUNT', opts.scanCount)
         : await client.scan(cursor, 'MATCH', pattern);
       cursor = nextCursor;
       keys.push(...scanKeys);
@@ -123,28 +124,27 @@ export default defineDriver((opts: RedisOptions) => {
       }
     },
     async setItems(items, commonOptions) {
-      const kv = Object.fromEntries(
-        items.map(item => [p(item.key), item.value])
-      );
-      await getRedisClient().mset(kv);
-
-      const ttls: [string, number][] = items
-        .map(item => {
-          const ttl = item.options?.ttl ?? commonOptions?.ttl ?? opts.ttl;
-          if (ttl) {
-            return [p(item.key), ttl];
-          }
-          return undefined;
-        })
-        .filter((item): item is [string, number] => item !== undefined);
-
-      if (ttls.length > 0) {
-        const pipeline = getRedisClient().pipeline();
-        ttls.forEach(ttl => {
-          pipeline.expire(ttl[0], ttl[1]);
-        });
-        await pipeline.exec();
+      if (items.length === 0) {
+        return;
       }
+
+      // One pipelined `SET ... EX` per item rather than `MSET` followed by a pipeline of `EXPIRE`.
+      // `MSET` writes every key without a TTL, so until the `EXPIRE` round trip lands the keys are
+      // immortal — and a process that dies in that window, or a serverless isolate that freezes
+      // after responding, leaves them that way for good. `SET ... EX` carries the expiry with the
+      // write, so a key never exists untimed. It also costs one round trip instead of two, and one
+      // command per item instead of one per item plus the `MSET`, which providers that bill per
+      // command charge for.
+      const pipeline = getRedisClient().pipeline();
+      for (const item of items) {
+        const ttl = item.options?.ttl ?? commonOptions?.ttl ?? opts.ttl;
+        if (ttl) {
+          pipeline.set(p(item.key), item.value, 'EX', ttl);
+        } else {
+          pipeline.set(p(item.key), item.value);
+        }
+      }
+      await pipeline.exec();
     },
     async removeItem(key) {
       await getRedisClient().unlink(p(key));
